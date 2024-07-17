@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
     // 打开CSV文件
-    let file = File::open("./data/test.csv")?;
+    let file = File::open("./data/test_twitter.csv")?;
 
     let reader = BufReader::new(file);
 
@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     debug!("Working set: length: {}", working_set.len());
 
     // 缓存大小比例计算优化
-    let step = 0.01;
+    let step = 0.005;
     let max_cache_size_ratio = 1.0;
     let mut result_lru = Vec::new();
     let mut result_fifo = Vec::new();
@@ -145,8 +145,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let y_range = y_max - y_min;
 
     // 根据数据范围设置图像尺寸
-    let width = (x_range * 1000.0).round() as u32; // 根据x轴范围调整宽度
-    let height = (y_range * 1000.0).round() as u32; // 根据y轴范围调整高度
+    let width = (x_range * 1500.0).round() as u32; // 根据x轴范围调整宽度
+    let height = (y_range * 1500.0).round() as u32; // 根据y轴范围调整高度
 
     // 绘制图像
     let mut fg = Figure::new();
