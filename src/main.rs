@@ -3,6 +3,7 @@ use fasthash::murmur3;
 use gnuplot::{AxesCommon, Figure, PlotOption::Caption};
 use hashbrown::HashSet;
 use lru::LruCache;
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::BufReader;
 use std::num::NonZeroUsize;
@@ -149,6 +150,31 @@ impl MiniSim {
         }
     }
 
+    fn remove(&mut self, key: Key) {
+        self.caches.par_iter_mut().for_each(|cache| {
+            cache.pop(&key);
+        });
+    }
+
+    fn clean(&mut self) {
+        self.caches.par_iter_mut().for_each(|cache| {
+            cache.clear();
+        });
+    }
+
+    fn verify_shards(&mut self, key: Key) -> bool {
+        if let Some(ref mut shards) = self.shards.as_mut() {
+            if !shards.sample(&key) {
+                return false;
+            }
+
+            if let Some(key) = shards.get_removal() {
+                self.remove(key);
+            }
+        }
+        true
+    }
+
     fn process(&mut self, access: Key) {
         self.access_count += 1;
 
@@ -160,6 +186,14 @@ impl MiniSim {
                 cache.put(access, ());
             }
         }
+    }
+
+    fn handle(&mut self, access: Key) {
+        if !self.verify_shards(access) {
+            return;
+        }
+
+        self.process(access);
     }
 
     fn curve(&self) -> Vec<(f64, f64)> {
@@ -197,12 +231,17 @@ fn draw(lines: &[Vec<(f64, f64)>], path: &str) {
         .lines(
             lines[0].iter().map(|(x, y)| *x),
             lines[0].iter().map(|(x, y)| *y),
-            &[Caption("Fixed rate")],
+            &[Caption("Fixed rate: 10%")],
         )
         .lines(
             lines[1].iter().map(|(x, y)| *x),
             lines[1].iter().map(|(x, y)| *y),
-            &[Caption("Without sim")],
+            &[Caption("Fixed rate: 50%")],
+        )
+        .lines(
+            lines[2].iter().map(|(x, y)| *x),
+            lines[2].iter().map(|(x, y)| *y),
+            &[Caption("Simulated")],
         );
 
     fg.save_to_png(path, width, height).unwrap();
@@ -218,7 +257,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
     // 打开CSV文件
-    let file = File::open("./data/test_mooncake.csv")?;
+    let file = File::open("./data/test.csv")?;
 
     let reader = BufReader::new(file);
 
@@ -245,14 +284,29 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // 启动两个线程，一个是sim，一个是sim_without_sim
     let kyes = Arc::new(keys);
+    let max_cache_size = working_set.len() as u64;
     let sim_handle = std::thread::spawn({
         let keys = Arc::clone(&kyes);
         move || {
-            let shards: Option<Box<dyn Shards>> = Some(Box::new(ShardsFixedRate::new(800)));
+            let shards: Option<Box<dyn Shards>> = Some(Box::new(ShardsFixedRate::new(100)));
             let start = std::time::Instant::now();
-            let mut sim = MiniSim::new(1000, shards);
+            let mut sim = MiniSim::new(max_cache_size, shards);
             for key in keys.iter() {
-                sim.process(*key);
+                sim.handle(*key);
+            }
+            debug!("Sim time: {:?}", start.elapsed());
+            sim.curve()
+        }
+    });
+
+    let sim_handle_50 = std::thread::spawn({
+        let keys = Arc::clone(&kyes);
+        move || {
+            let shards: Option<Box<dyn Shards>> = Some(Box::new(ShardsFixedRate::new(500)));
+            let start = std::time::Instant::now();
+            let mut sim = MiniSim::new(max_cache_size, shards);
+            for key in keys.iter() {
+                sim.handle(*key);
             }
             debug!("Sim time: {:?}", start.elapsed());
             sim.curve()
@@ -264,9 +318,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         move || {
             let shards: Option<Box<dyn Shards>> = None;
             let start = std::time::Instant::now();
-            let mut sim_without_sim = MiniSim::new(1000, shards);
+            let mut sim_without_sim = MiniSim::new(max_cache_size, shards);
             for key in keys.iter() {
-                sim_without_sim.process(*key);
+                sim_without_sim.handle(*key);
             }
             debug!("Sim without shards time: {:?}", start.elapsed());
             sim_without_sim.curve()
@@ -275,6 +329,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut lines = Vec::new();
     lines.push(sim_handle.join().unwrap());
+    lines.push(sim_handle_50.join().unwrap());
     lines.push(sim_without_shards_handle.join().unwrap());
 
     draw(&lines, "miss_ratio_curve.png");
