@@ -1,53 +1,177 @@
 use csv::ReaderBuilder;
-use gnuplot::{
-    AxesCommon, Figure,
-    PlotOption::{Caption, Color},
-};
+use fasthash::murmur3;
+use gnuplot::{AxesCommon, Figure, PlotOption::Caption};
 use hashbrown::HashSet;
-use std::collections::VecDeque;
-use std::error::Error;
+use lru::LruCache;
 use std::fs::File;
 use std::io::BufReader;
 use std::num::NonZeroUsize;
+use std::{error::Error, sync::Arc};
 use tracing::{debug, Level};
 use tracing_subscriber::FmtSubscriber;
 
-fn lru_miss_ratio(keys: &Vec<u64>, cache_size: NonZeroUsize) -> f64 {
-    let mut cache = lru::LruCache::new(cache_size);
-    let mut miss = 0;
-    for key in keys.iter() {
-        if cache.contains(key) {
-            cache.get(key);
-        } else {
-            cache.put(*key, ());
-            miss += 1;
-        }
-    }
-    miss as f64 / keys.len() as f64
+const NUM_CACHE_SIZE: u64 = 100;
+type Key = u64;
+const MODULUS: u64 = 1000;
+
+fn hash(key: Key) -> u128 {
+    murmur3::hash128(key.to_le_bytes())
 }
 
-fn fifo_miss_ratio(keys: &Vec<u64>, cache_size: NonZeroUsize) -> f64 {
-    let mut cache = VecDeque::with_capacity(cache_size.get());
-    let mut cache_set = HashSet::with_capacity(cache_size.get());
-    let mut miss = 0;
+pub trait Shards: Send {
+    fn get_global_t(&self) -> u64;
+    fn get_sampled_count(&self) -> u64;
+    fn get_total_count(&self) -> u64;
+    fn get_expected_count(&self) -> u64;
 
-    for key in keys {
-        if cache_set.contains(key) {
-            // 如果缓存中已经存在该键，不做任何操作
-            continue;
-        }
+    fn get_correction(&self) -> i64 {
+        self.get_expected_count() as i64 - self.get_sampled_count() as i64
+    }
 
-        cache.push_back(*key);
-        cache_set.insert(*key);
-        miss += 1;
+    fn get_rate(&self) -> f64 {
+        self.get_global_t() as f64 / MODULUS as f64
+    }
 
-        if cache.len() > cache_size.get() {
-            let removed_key = cache.pop_front().unwrap();
-            cache_set.remove(&removed_key);
+    fn sample(&mut self, access: &Key) -> bool;
+
+    fn sample_key(&self, key: Key) -> Option<u64> {
+        let t = (hash(key) % MODULUS as u128) as u64;
+
+        match t < self.get_global_t() {
+            true => Some(t),
+            false => None,
         }
     }
 
-    miss as f64 / keys.len() as f64
+    fn scale(&self, size: u64) -> u64 {
+        (size as f64 * self.get_rate()) as u64
+    }
+
+    fn unscale(&self, size: u64) -> u64 {
+        (size as f64 / self.get_rate()) as u64
+    }
+
+    fn get_removal(&mut self) -> Option<Key> {
+        None
+    }
+}
+
+pub struct ShardsFixedRate {
+    global_t: u64,
+
+    sampled_count: u64,
+    total_count: u64,
+}
+
+impl ShardsFixedRate {
+    #[allow(dead_code)]
+    pub fn new(global_t: u64) -> Self {
+        ShardsFixedRate {
+            global_t,
+
+            sampled_count: 0,
+            total_count: 0,
+        }
+    }
+}
+
+impl Shards for ShardsFixedRate {
+    fn get_global_t(&self) -> u64 {
+        self.global_t
+    }
+
+    fn get_sampled_count(&self) -> u64 {
+        self.sampled_count
+    }
+
+    fn get_total_count(&self) -> u64 {
+        self.total_count
+    }
+
+    fn get_expected_count(&self) -> u64 {
+        (self.get_rate() * self.total_count as f64) as u64
+    }
+
+    fn sample(&mut self, access: &Key) -> bool {
+        self.total_count += 1;
+
+        if self.sample_key(*access).is_none() {
+            return false;
+        }
+
+        self.sampled_count += 1;
+
+        true
+    }
+}
+
+struct MiniSim {
+    max_cache_size: u64,
+    caches: Vec<LruCache<Key, ()>>,
+    hits: Vec<u64>,
+    access_count: u64,
+    shards: Option<Box<dyn Shards>>,
+    shards_global_t: u64,
+}
+
+fn get_caches(
+    max_cache_size: u64,
+    num_caches: u64,
+    shards: &Option<Box<dyn Shards>>,
+) -> Vec<LruCache<Key, ()>> {
+    (1..=num_caches)
+        .map(|i| {
+            let mut cache_size = (i + 1) * (max_cache_size / num_caches as u64);
+
+            if let Some(shards) = shards.as_ref() {
+                cache_size = shards.scale(cache_size);
+            }
+            LruCache::new(NonZeroUsize::new(cache_size as usize).unwrap())
+        })
+        .collect()
+}
+
+impl MiniSim {
+    pub fn new(max_cache_size: u64, shards: Option<Box<dyn Shards>>) -> Self {
+        let caches = get_caches(max_cache_size, NUM_CACHE_SIZE, &shards);
+        let shards_global_t = shards
+            .as_ref()
+            .map(|shards| shards.get_global_t())
+            .unwrap_or(0);
+
+        MiniSim {
+            max_cache_size,
+            caches,
+            hits: vec![0; NUM_CACHE_SIZE as usize],
+            access_count: 0,
+            shards,
+            shards_global_t,
+        }
+    }
+
+    fn process(&mut self, access: Key) {
+        self.access_count += 1;
+
+        for (i, cache) in self.caches.iter_mut().enumerate() {
+            if cache.contains(&access) {
+                self.hits[i] += 1;
+                cache.get(&access);
+            } else {
+                cache.put(access, ());
+            }
+        }
+    }
+
+    fn curve(&self) -> Vec<(f64, f64)> {
+        let mut points = Vec::new();
+        points.push((0.0, 1.0));
+        for (i, hit) in self.hits.iter().enumerate() {
+            let miss_ratio = 1.0 - *hit as f64 / self.access_count as f64;
+            let cache_size = (i + 1) as f64 / NUM_CACHE_SIZE as f64;
+            points.push((cache_size as f64, miss_ratio));
+        }
+        return points;
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -59,6 +183,30 @@ struct AccessRecord {
     ttl: u32,
 }
 
+fn draw(lines: &[Vec<(f64, f64)>], path: &str) {
+    let mut fg = Figure::new();
+
+    let width = 1920;
+    let height = 1080;
+
+    fg.set_title("Miss ratio curve");
+
+    fg.axes2d()
+        .set_x_label("Cache size", &[])
+        .set_y_label("Miss ratio", &[])
+        .lines(
+            lines[0].iter().map(|(x, y)| *x),
+            lines[0].iter().map(|(x, y)| *y),
+            &[Caption("Fixed rate")],
+        )
+        .lines(
+            lines[1].iter().map(|(x, y)| *x),
+            lines[1].iter().map(|(x, y)| *y),
+            &[Caption("Without sim")],
+        );
+
+    fg.save_to_png(path, width, height).unwrap();
+}
 fn main() -> Result<(), Box<dyn Error>> {
     // a builder for `FmtSubscriber`.
     let subscriber = FmtSubscriber::builder()
@@ -70,7 +218,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
     // 打开CSV文件
-    let file = File::open("./data/test_twitter.csv")?;
+    let file = File::open("./data/test_mooncake.csv")?;
 
     let reader = BufReader::new(file);
 
@@ -95,76 +243,41 @@ fn main() -> Result<(), Box<dyn Error>> {
     debug!("First access record: {:?}", access_records[0]);
     debug!("Working set: length: {}", working_set.len());
 
-    // 缓存大小比例计算优化
-    let step = 0.005;
-    let max_cache_size_ratio = 1.0;
-    let mut result_lru = Vec::new();
-    let mut result_fifo = Vec::new();
+    // 启动两个线程，一个是sim，一个是sim_without_sim
+    let kyes = Arc::new(keys);
+    let sim_handle = std::thread::spawn({
+        let keys = Arc::clone(&kyes);
+        move || {
+            let shards: Option<Box<dyn Shards>> = Some(Box::new(ShardsFixedRate::new(800)));
+            let start = std::time::Instant::now();
+            let mut sim = MiniSim::new(1000, shards);
+            for key in keys.iter() {
+                sim.process(*key);
+            }
+            debug!("Sim time: {:?}", start.elapsed());
+            sim.curve()
+        }
+    });
 
-    // 加入 (0,1)
-    result_lru.push((0.0, 1.0));
-    result_fifo.push((0.0, 1.0));
+    let sim_without_shards_handle = std::thread::spawn({
+        let keys = Arc::clone(&kyes);
+        move || {
+            let shards: Option<Box<dyn Shards>> = None;
+            let start = std::time::Instant::now();
+            let mut sim_without_sim = MiniSim::new(1000, shards);
+            for key in keys.iter() {
+                sim_without_sim.process(*key);
+            }
+            debug!("Sim without shards time: {:?}", start.elapsed());
+            sim_without_sim.curve()
+        }
+    });
 
-    for i in 1..=(max_cache_size_ratio / step) as usize {
-        let cache_size_ratio = i as f64 * step;
-        let cache_size = (cache_size_ratio * working_set.len() as f64).round() as usize; // 使用四舍五入确保整数
+    let mut lines = Vec::new();
+    lines.push(sim_handle.join().unwrap());
+    lines.push(sim_without_shards_handle.join().unwrap());
 
-        // LRU
-        let lru_ratio = lru_miss_ratio(&keys, NonZeroUsize::new(cache_size).unwrap());
-        println!(
-            "cache size: {}, lru miss ratio: {}",
-            cache_size_ratio, lru_ratio
-        );
-        result_lru.push((cache_size_ratio, lru_ratio));
-
-        // FIFO
-        let fifo_ratio = fifo_miss_ratio(&keys, NonZeroUsize::new(cache_size).unwrap()); // 深拷贝keys
-        println!(
-            "cache size: {}, fifo miss ratio: {}",
-            cache_size_ratio, fifo_ratio
-        );
-        result_fifo.push((cache_size_ratio, fifo_ratio));
-    }
-
-    // 绘制图像
-    // 计算合适的图像尺寸
-    let x_min = result_lru[0].0;
-    let x_max = result_lru.last().unwrap().0;
-    let y_min = result_lru
-        .iter()
-        .map(|(_, y)| *y)
-        .min_by(|a, b| a.partial_cmp(b).unwrap())
-        .unwrap();
-    let y_max = result_lru
-        .iter()
-        .map(|(_, y)| *y)
-        .max_by(|a, b| a.partial_cmp(b).unwrap())
-        .unwrap();
-
-    let x_range = x_max - x_min;
-    let y_range = y_max - y_min;
-
-    // 根据数据范围设置图像尺寸
-    let width = (x_range * 1500.0).round() as u32; // 根据x轴范围调整宽度
-    let height = (y_range * 1500.0).round() as u32; // 根据y轴范围调整高度
-
-    // 绘制图像
-    let mut fg = Figure::new();
-    fg.axes2d()
-        .set_title("Miss Ratio Curve", &[])
-        .set_x_label("Cache Size / Working Set Size", &[])
-        .set_y_label("Miss Ratio", &[])
-        .lines(
-            result_lru.iter().map(|(x, _)| *x),
-            result_lru.iter().map(|(_, y)| *y),
-            &[Caption("LRU"), Color("blue")],
-        )
-        .lines(
-            result_fifo.iter().map(|(x, _)| *x),
-            result_fifo.iter().map(|(_, y)| *y),
-            &[Caption("FIFO"), Color("red")],
-        );
-    fg.save_to_png("result.png", width, height).unwrap();
+    draw(&lines, "miss_ratio_curve.png");
 
     Ok(())
 }
