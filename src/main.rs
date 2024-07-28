@@ -1,14 +1,8 @@
-use clap::Parser;
-use config::{load_access_records, Config};
-
+use config::{load_access_records, Config, InnerConfig};
 use draw::draw_lines;
-use evict_policy::{EvictPolicy, FifoPolicy, LruPolicy};
-
+use evict_policy::{EvictPolicy, FifoPolicy, LfuPolicy, LruPolicy, TwoQPolicy};
 use minisim::MiniSim;
-
 use shards::ShardsFixedRate;
-
-use std::path::PathBuf;
 use std::thread;
 use std::{error::Error, sync::Arc};
 use tracing::{debug, info, Level};
@@ -65,31 +59,32 @@ fn simulation<P: EvictPolicy>(
     SimulationResult { points, label }
 }
 
-fn simulate_all(access_records: Arc<Vec<AccessRecord>>, args: &Config) {
+fn simulate_all(access_records: Arc<Vec<AccessRecord>>, args: &InnerConfig) {
     let max_cache_size = args.cache_size;
-
-    // 调试policies
-    debug!("Simulation policies: {:?}", args.policies);
-    // 使用多线程，为args中的每一个policy创建一个MiniSim
+    info!("Simulation policies: {:?}", args.policies);
+    info!("Simple rate: {:?}", args.sample_rate);
     let handles = args
         .policies
         .iter()
         .map(|policy: &config::EvictionPolicy| {
             let access_records = Arc::clone(&access_records);
             let label = policy.to_string();
+            let shards = ShardsFixedRate::create_shards(args.sample_rate);
             match policy {
                 config::EvictionPolicy::LRU => {
-                    let sim = MiniSim::<LruPolicy>::new(
-                        max_cache_size,
-                        Some(Box::new(ShardsFixedRate::new(10))),
-                    );
+                    let sim = MiniSim::<LruPolicy>::new(max_cache_size, shards);
                     thread::spawn(move || simulation(access_records, sim, label))
                 }
                 config::EvictionPolicy::FIFO => {
-                    let sim = MiniSim::<FifoPolicy>::new(
-                        max_cache_size,
-                        Some(Box::new(ShardsFixedRate::new(10))),
-                    );
+                    let sim = MiniSim::<FifoPolicy>::new(max_cache_size, shards);
+                    thread::spawn(move || simulation(access_records, sim, label))
+                }
+                &config::EvictionPolicy::LFU => {
+                    let sim = MiniSim::<LfuPolicy>::new(max_cache_size, shards);
+                    thread::spawn(move || simulation(access_records, sim, label))
+                }
+                &config::EvictionPolicy::TWOQ => {
+                    let sim = MiniSim::<TwoQPolicy>::new(max_cache_size, shards);
                     thread::spawn(move || simulation(access_records, sim, label))
                 }
             }
@@ -105,21 +100,17 @@ fn simulate_all(access_records: Arc<Vec<AccessRecord>>, args: &Config) {
 
 fn main() -> Result<(), Box<dyn Error>> {
     init_logger();
-    let config = Config::parse();
-
+    let config = Config::load();
     let access_records = load_access_records(&config);
+    let config = InnerConfig::from(config);
+    info!("Simulation config: {:?}", config);
     debug_assert!(access_records.len() > 0);
     debug!("Access records: length: {}", access_records.len());
-    // debug first ten records
-    for record in access_records.iter().take(10) {
+    for record in access_records.iter().take(5) {
         debug!("{:?}", record);
     }
-
-    // 启动两个线程，一个是sim，一个是sim_without_sim
     let access_records = Arc::new(access_records);
     simulate_all(access_records.clone(), &config);
-
     debug!("Simulation completed successfully");
-
     Ok(())
 }

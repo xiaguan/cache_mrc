@@ -2,7 +2,7 @@ use fasthash::murmur3;
 
 use crate::Key;
 
-const MODULUS: u64 = 100;
+const MODULUS: u64 = 1000;
 fn hash(key: Key) -> u128 {
     murmur3::hash128(key.to_le_bytes())
 }
@@ -35,10 +35,6 @@ pub trait Shards: Send {
     fn scale(&self, size: u64) -> u64 {
         (size as f64 * self.get_rate()) as u64
     }
-
-    fn unscale(&self, size: u64) -> u64 {
-        (size as f64 / self.get_rate()) as u64
-    }
 }
 
 pub struct ShardsFixedRate {
@@ -48,12 +44,20 @@ pub struct ShardsFixedRate {
 }
 
 impl ShardsFixedRate {
-    #[allow(dead_code)]
     pub fn new(global_t: u64) -> Self {
         ShardsFixedRate {
             global_t,
             sampled_count: 0,
             total_count: 0,
+        }
+    }
+
+    pub fn create_shards(simple_rate: Option<f64>) -> Option<Box<dyn Shards>> {
+        match simple_rate {
+            Some(rate) => Some(Box::new(ShardsFixedRate::new(
+                (rate * MODULUS as f64) as u64,
+            ))),
+            None => None,
         }
     }
 }

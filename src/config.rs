@@ -8,9 +8,7 @@ use crate::AccessRecord;
 use clap::Parser;
 use csv::ReaderBuilder;
 use serde::{Deserialize, Serialize};
-use serfig::collectors::{from_env, from_file, from_self};
-use serfig::parsers::Toml;
-use tracing::debug;
+use tracing::{debug, error};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Parser, Default)]
 #[clap(author, version, about, long_about = None)]
@@ -23,21 +21,25 @@ pub struct Config {
 
     /// Path to the trace file
     #[arg(long, value_name = "FILE")]
-    pub trace: PathBuf,
+    pub trace: Option<PathBuf>,
+
+    /// Sample rate
+    #[arg(long)]
+    pub sample_rate: Option<f64>,
 
     /// Path to the output file
     #[arg(long, value_name = "FILE")]
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
 
     /// Cache eviction policies (LRU, FIFO, etc.)
     #[arg(long, value_enum, use_value_delimiter = true, value_delimiter = ',')]
     #[serde(default = "default_eviction_policies")]
-    pub policies: Vec<EvictionPolicy>,
+    pub policies: Option<Vec<EvictionPolicy>>,
 
     /// Cache size (e.g., 100KB, 2MB)
     #[arg(short, long, value_parser = parse_size)]
     #[serde(deserialize_with = "deserialize_cache_size")]
-    pub cache_size: u64,
+    pub cache_size: Option<u64>,
 
     #[arg(long)]
     pub timestamp: Option<i32>,
@@ -55,6 +57,25 @@ pub struct Config {
     pub ttl: Option<i32>,
 }
 
+#[derive(Debug)]
+pub struct InnerConfig {
+    pub output: PathBuf,
+    pub policies: Vec<EvictionPolicy>,
+    pub cache_size: u64,
+    pub sample_rate: Option<f64>,
+}
+
+impl From<Config> for InnerConfig {
+    fn from(config: Config) -> Self {
+        InnerConfig {
+            output: config.output.unwrap(),
+            policies: config.policies.unwrap(),
+            cache_size: config.cache_size.unwrap(),
+            sample_rate: config.sample_rate,
+        }
+    }
+}
+
 impl Config {
     pub fn from_file(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
@@ -64,11 +85,11 @@ impl Config {
     }
 }
 
-fn default_eviction_policies() -> Vec<EvictionPolicy> {
-    vec![EvictionPolicy::LRU]
+fn default_eviction_policies() -> Option<Vec<EvictionPolicy>> {
+    Some(vec![EvictionPolicy::LRU])
 }
 
-fn deserialize_cache_size<'de, D>(deserializer: D) -> Result<u64, D::Error>
+fn deserialize_cache_size<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -81,6 +102,8 @@ where
 pub enum EvictionPolicy {
     LRU,
     FIFO,
+    LFU,
+    TWOQ,
 }
 
 impl EvictionPolicy {
@@ -88,14 +111,16 @@ impl EvictionPolicy {
         match self {
             EvictionPolicy::LRU => "LRU",
             EvictionPolicy::FIFO => "FIFO",
+            EvictionPolicy::LFU => "LFU",
+            EvictionPolicy::TWOQ => "TWOQ",
         }
         .to_string()
     }
 }
 
-fn parse_size(s: &str) -> Result<u64, String> {
+fn parse_size(s: &str) -> Result<Option<u64>, String> {
     let s = s.trim().to_uppercase();
-    if s.ends_with("KB") {
+    let cache_size = if s.ends_with("KB") {
         s[..s.len() - 2]
             .parse::<u64>()
             .map(|n| n * 1024)
@@ -112,11 +137,13 @@ fn parse_size(s: &str) -> Result<u64, String> {
             .map_err(|e| e.to_string())
     } else {
         s.parse::<u64>().map_err(|e| e.to_string())
-    }
+    };
+    cache_size.map(Some)
 }
 
 pub fn load_access_records(arg: &Config) -> Vec<AccessRecord> {
-    let file = File::open(&arg.trace).unwrap();
+    let trace_path = arg.trace.as_ref().unwrap();
+    let file = File::open(trace_path).unwrap();
     let reader = BufReader::new(file);
     let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(reader);
 
@@ -179,18 +206,18 @@ fn parse_field(record: &csv::StringRecord, field_opt: Option<i32>, default: u64)
 }
 
 impl Config {
-    pub fn load(arg_conf: Self) -> Self {
-        let mut builder: serfig::Builder<Self> = serfig::Builder::default();
-
-        // Load from config fil
-        if let Some(config_file) = &arg_conf.config_file {
-            builder = builder.collect(from_file(Toml, config_file.to_str().unwrap()));
+    pub fn load() -> Self {
+        let args = Config::parse();
+        if let Some(path) = &args.config_file {
+            match Config::from_file(path) {
+                Ok(config) => config,
+                Err(e) => {
+                    error!("Failed to load configuration file: {}", e);
+                    args
+                }
+            }
+        } else {
+            args
         }
-
-        // Load from arguments
-        builder = builder.collect(from_self(arg_conf));
-
-        // Build the configuration
-        builder.build().unwrap()
     }
 }
