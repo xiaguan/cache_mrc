@@ -1,0 +1,10 @@
+trace = "./data/test_mooncake.csv"
+
+# 输出文件前缀
+output = "./output/mrc.png"
+
+# 缓存策略列表，可以指定多个
+policies = ["LRU", "FIFO"]
+
+# 缓存大小
+cache_size = "100MB"

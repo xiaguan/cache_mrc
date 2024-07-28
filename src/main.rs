@@ -1,24 +1,39 @@
-use csv::ReaderBuilder;
+use clap::Parser;
+use config::{load_access_records, Config};
 
-use evict_policy::{EvictPolicy, LruPolicy};
-use gnuplot::{AxesCommon, Figure, PlotOption::Caption};
-use hashbrown::HashSet;
+use draw::draw_lines;
+use evict_policy::{EvictPolicy, FifoPolicy, LruPolicy};
 
 use minisim::MiniSim;
+
 use shards::ShardsFixedRate;
-use std::fs::File;
-use std::io::BufReader;
+
+use std::path::PathBuf;
 use std::thread;
 use std::{error::Error, sync::Arc};
 use tracing::{debug, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
+mod config;
+mod draw;
 mod evict_policy;
 mod minisim;
 mod shards;
 
 const NUM_CACHE_SIZE: u64 = 100;
 type Key = u64;
+
+fn init_logger() {
+    // a builder for `FmtSubscriber`.
+    let subscriber = FmtSubscriber::builder()
+        // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
+        // will be written to stdout.
+        .with_max_level(Level::TRACE)
+        // completes the builder.
+        .finish();
+
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+}
 
 #[derive(Debug, serde::Deserialize)]
 struct AccessRecord {
@@ -50,101 +65,60 @@ fn simulation<P: EvictPolicy>(
     SimulationResult { points, label }
 }
 
-// Draw the lines
-// Parameter: Vec<SimulationResult>
-fn draw_lines(results: &[SimulationResult], path: &str) {
-    let mut fg = Figure::new();
+fn simulate_all(access_records: Arc<Vec<AccessRecord>>, args: &Config) {
+    let max_cache_size = args.cache_size;
 
-    let width = 1920;
-    let height = 1080;
-
-    fg.set_title("Miss ratio curve");
-    let axes = fg.axes2d();
-    for result in results {
-        axes.set_x_label("Cache size", &[])
-            .set_y_label("Miss ratio", &[])
-            .lines(
-                result.points.iter().map(|(x, _)| *x),
-                result.points.iter().map(|(_, y)| *y),
-                &[Caption(result.label.as_str())],
-            );
-    }
-    fg.save_to_png(path, width, height).unwrap();
-}
-
-// Simulate for a access reocrds
-// Use multi thread to simulate
-// 1. simulate without shards
-// 2. simulate with 10% shards
-// 3. simulate with 1% shards
-// collect result to draw
-fn simulate_all<P: EvictPolicy + 'static>(
-    access_records: Arc<Vec<AccessRecord>>,
-    max_cache_size: u64,
-    path: &str,
-) {
-    let sim_without_shards = MiniSim::<P>::new(max_cache_size, None);
-    let sim_10_shards = MiniSim::new(max_cache_size, Some(Box::new(ShardsFixedRate::new(10))));
-    let sim_1_shards = MiniSim::new(max_cache_size, Some(Box::new(ShardsFixedRate::new(1))));
-
-    let simulations = vec![
-        ("Without shards", sim_without_shards),
-        ("10% shards", sim_10_shards),
-        ("1% shards", sim_1_shards),
-    ];
-
-    let handles: Vec<_> = simulations
-        .into_iter()
-        .map(|(label, sim)| {
+    // 调试policies
+    debug!("Simulation policies: {:?}", args.policies);
+    // 使用多线程，为args中的每一个policy创建一个MiniSim
+    let handles = args
+        .policies
+        .iter()
+        .map(|policy: &config::EvictionPolicy| {
             let access_records = Arc::clone(&access_records);
-            let label = label.to_string();
-            thread::spawn(move || simulation(access_records, sim, label))
+            let label = policy.to_string();
+            match policy {
+                config::EvictionPolicy::LRU => {
+                    let sim = MiniSim::<LruPolicy>::new(
+                        max_cache_size,
+                        Some(Box::new(ShardsFixedRate::new(10))),
+                    );
+                    thread::spawn(move || simulation(access_records, sim, label))
+                }
+                config::EvictionPolicy::FIFO => {
+                    let sim = MiniSim::<FifoPolicy>::new(
+                        max_cache_size,
+                        Some(Box::new(ShardsFixedRate::new(10))),
+                    );
+                    thread::spawn(move || simulation(access_records, sim, label))
+                }
+            }
         })
-        .collect();
+        .collect::<Vec<_>>();
 
-    let results: Vec<_> = handles
+    let results = handles
         .into_iter()
         .map(|handle| handle.join().unwrap())
-        .collect();
-
-    draw_lines(&results, path);
+        .collect::<Vec<_>>();
+    draw_lines(&results, args.output.clone());
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // a builder for `FmtSubscriber`.
-    let subscriber = FmtSubscriber::builder()
-        // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
-        // will be written to stdout.
-        .with_max_level(Level::TRACE)
-        // completes the builder.
-        .finish();
+    init_logger();
+    let config = Config::parse();
 
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-    // 打开CSV文件
-    let file = File::open("./data/test_twitter.csv")?;
-
-    let reader = BufReader::new(file);
-
-    let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(reader);
-
-    let mut access_records = Vec::new();
-    for result in rdr.deserialize() {
-        let record: AccessRecord = result?;
-        access_records.push(record);
-    }
+    let access_records = load_access_records(&config);
     debug_assert!(access_records.len() > 0);
-
     debug!("Access records: length: {}", access_records.len());
-    debug!("First access record: {:?}", access_records[0]);
+    // debug first ten records
+    for record in access_records.iter().take(10) {
+        debug!("{:?}", record);
+    }
 
     // 启动两个线程，一个是sim，一个是sim_without_sim
     let access_records = Arc::new(access_records);
-    simulate_all::<LruPolicy>(
-        access_records.clone(),
-        4000000,
-        "./lru_miss_ratio_curve.png",
-    );
-    simulate_all::<LruPolicy>(access_records, 4000000, "./fifo_miss_ratio_curve.png");
+    simulate_all(access_records.clone(), &config);
+
     debug!("Simulation completed successfully");
 
     Ok(())
